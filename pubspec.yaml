@@ -1,0 +1,24 @@
+name: oee
+description: OEE — monitorizare opriri linie (tableta Android, client BLE pentru ESP32-S3).
+publish_to: none
+version: 0.15.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_blue_plus: ^1.35.3
+  flutter_foreground_task: ^8.17.0
+  permission_handler: ^11.3.1
+  sqflite: ^2.3.3+1
+  path: ^1.9.0
+  path_provider: ^2.1.5
+  share_plus: ^10.1.4
+
+dev_dependencies:
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
