@@ -25,7 +25,8 @@ const _kLive = -1; // „Ultimele 8 ore” (live)
 const _kCustom = -2; // „Interval” (de la – pana la, ales de utilizator)
 
 class _Ev {
-  _Ev(this.st, this.from, this.to, this.ms, this.cat, this.sub, this.comment, this.kind);
+  _Ev(this.st, this.from, this.to, this.ms, this.cat, this.sub, this.comment, this.kind, {this.synthetic = false});
+  final bool synthetic; // oprire de inceput de schimb creata local (device APP)
   final String st;
   final String? kind; // clasa IWS a motivului (unscheduled | planned | unplanned | ...), null = neclasificat sau cod vechi
   final DateTime from, to;
@@ -63,6 +64,17 @@ String _hhmm(DateTime t) {
 }
 
 String _iso(DateTime t) => '${t.toUtc().toIso8601String().split('.').first}Z';
+
+/// 5285 -> „5.285” (separator de mii).
+String _group(int n) {
+  final s = n.abs().toString();
+  final b = StringBuffer();
+  for (var i = 0; i < s.length; i++) {
+    if (i > 0 && (s.length - i) % 3 == 0) b.write('.');
+    b.write(s[i]);
+  }
+  return n < 0 ? '-$b' : b.toString();
+}
 
 String _pct(double? v) => v == null ? '—' : '${(v * 100).round()}%';
 
@@ -124,13 +136,14 @@ class _LinePageState extends State<LinePage> {
   List<_Ev> _events = const [];
   List<_Rng> _noData = const [];
   List<double?> _series = const [];
-  List<double?> _targets = const []; // tinta (buc/min) pe fiecare bucata a graficului
+  List<double?> _targets = const []; // tinta (buc/ora) pe fiecare bucata a graficului
   int _bucketS = 60;
   DateTime? _chartStart;
   DateTime? _effStart; // primul moment cu date in fereastra
   double? _avail, _perf, _oee;
   int _stopMs = 0, _stopCount = 0, _noDataMs = 0, _unknownPulses = 0, _plannedMs = 0, _windowMs = 0;
-  double? _speedNow; // buc/min in ultimul minut
+  double? _speedNow; // buc/ora, calculat pe ultimul minut
+  int _pieces = 0; // sticle numarate in fereastra afisata (de la inceputul schimbului)
   int _exclMs = 0; // timp exclus din calcul (opriri neprogramate / planificate, dupa setare)
   int _loadedCh = 1; // canalul pentru care sunt incarcate rezultatele
   int _pending = 0; // opriri de clasificat pe canalul afisat
@@ -352,12 +365,25 @@ class _LinePageState extends State<LinePage> {
       final k1 = r['k1'] as String?;
       final c1 = r['c1'] as String?;
       evs.add(_Ev('${r['st']}', f, t, ms, c1 == null ? null : lossLabel(c1, k1), r['c2'] as String?,
-          r['comment'] as String?, k1));
+          r['comment'] as String?, k1, synthetic: r['device'] == kAppDevice));
+    }
+    // oprire de inceput de schimb (de la inceputul schimbului pana la prima sticla): calculul porneste de la inceputul schimbului
+    _Ev? lead;
+    for (final e in evs) {
+      if (e.synthetic && e.st == 'stop' && !e.from.isAfter(w.start.add(const Duration(seconds: 1)))) lead = e;
+    }
+    // schimb in desfasurare, conectat, canal activ, nicio sticla inca in schimb: oprirea inca nu e salvata, dar se numara
+    final sinceStart = nowU.difference(w.start).inSeconds;
+    if (lead == null && w.isShift && !w.custom && ble.connected && chActive && nowU.isBefore(w.end) && sinceStart >= 60 &&
+        ((pt['pulses'] as num?)?.toInt() ?? 0) == 0 && !evs.any((e) => e.st != 'stop')) {
+      lead = _Ev('stop', w.start, nowU, nowU.difference(w.start).inMilliseconds, null, null, null, null, synthetic: true);
+      evs.add(lead);
     }
 
     final ds = first == null ? null : DateTime.tryParse(first);
     // canal fara date in fereastra: nimic de calculat (nu 100 % disponibilitate)
-    final es = span == null ? upTo : ((ds != null && ds.isAfter(w.start)) ? ds : w.start);
+    var es = span == null ? upTo : ((ds != null && ds.isAfter(w.start)) ? ds : w.start);
+    if (lead != null) es = w.start;
 
     // intervale fara date (ESP32 repornit): de la ultimul mesaj din boot-ul precedent pana la mesajul boot
     final gaps = <_Rng>[];
@@ -373,6 +399,20 @@ class _LinePageState extends State<LinePage> {
       }
       final pl = r['prev_last'] == null ? null : DateTime.tryParse('${r['prev_last']}');
       if (bt != null && pl != null && bt.isAfter(pl)) gaps.add(_Rng(pl, bt));
+    }
+    // golurile din oprirea de inceput de schimb nu se mai numara ca „fara date” (e deja oprire)
+    if (lead != null) {
+      final le = lead.to;
+      for (var i = gaps.length - 1; i >= 0; i--) {
+        final g = gaps[i];
+        if (g.b.isAfter(w.start) && g.a.isBefore(le)) {
+          if (g.b.isAfter(le)) {
+            gaps[i] = _Rng(g.a.isAfter(le) ? g.a : le, g.b);
+          } else {
+            gaps.removeAt(i);
+          }
+        }
+      }
     }
     // canal inactiv: dupa ultimul lui mesaj nu mai sunt date
     final lastCh = span == null ? null : DateTime.tryParse(span.$2);
@@ -408,7 +448,9 @@ class _LinePageState extends State<LinePage> {
       }
     }
     final st = ble.viewStatus;
-    if (ble.connected && st != null && st.state == 2) {
+    // (daca oprirea de inceput de schimb e inca in curs, ea acopera deja acest interval)
+    final leadLive = lead != null && lead.to.isAfter(nowU.subtract(const Duration(seconds: 2)));
+    if (ble.connected && st != null && st.state == 2 && !leadLive) {
       final lf = nowU.subtract(Duration(milliseconds: st.sinceLastMs));
       final o = _overlap(lf, nowU, es, upTo);
       if (o > 0) {
@@ -455,7 +497,7 @@ class _LinePageState extends State<LinePage> {
       cov[idx] += 1;
     }
     final series = <double?>[
-      for (var i = 0; i < nb; i++) cov[i] == 0 ? null : sums[i] * 60.0 / (cov[i] * _intervalS),
+      for (var i = 0; i < nb; i++) cov[i] == 0 ? null : sums[i] * 3600.0 / (cov[i] * _intervalS), // buc / ora
     ];
 
     // tinta pe fiecare bucata: ritmul propriu al canalului sau al produsului run-ului din acea bucata (se mentine pana la urmatorul run)
@@ -468,12 +510,12 @@ class _LinePageState extends State<LinePage> {
       if (idx < 0 || idx >= nb) continue;
       lastRun[idx] = (r['run'] as num?)?.toInt();
     }
-    final dflt = ble.activeRun == null ? null : ble.activeRun!.sku.rateFor(ch) / 60;
+    final dflt = ble.activeRun == null ? null : ble.activeRun!.sku.rateFor(ch); // buc / ora
     final targets = List<double?>.filled(nb, null);
     double? carry;
     for (var i = 0; i < nb; i++) {
       final p = lastRun[i] == null ? null : paces[lastRun[i]!];
-      if (p != null) carry = p / 60;
+      if (p != null) carry = p; // buc / ora
       targets[i] = carry ?? dflt;
     }
 
@@ -499,7 +541,7 @@ class _LinePageState extends State<LinePage> {
       rn += (r['n'] as num?)?.toInt() ?? 0;
       rc++;
     }
-    if (rc > 0) speedNow = rn * 60.0 / (rc * _intervalS);
+    if (rc > 0) speedNow = rn * 3600.0 / (rc * _intervalS); // buc / ora
 
     if (!mounted) return;
     setState(() {
@@ -522,6 +564,7 @@ class _LinePageState extends State<LinePage> {
       _windowMs = upTo.difference(w.start).inMilliseconds;
       _unknownPulses = unknown;
       _speedNow = speedNow;
+      _pieces = pulses;
     });
   }
 
@@ -680,10 +723,10 @@ class _LinePageState extends State<LinePage> {
     return null;
   }
 
-  /// Tinta de viteza (buc/min) a canalului afisat: viteza din reteta produsului activ pe acest canal.
+  /// Tinta de viteza (buc/ora) a canalului afisat: viteza din reteta produsului activ pe acest canal.
   double? _targetBpm() {
     final run = widget.ble.activeRun;
-    return run == null ? null : run.sku.rateFor(widget.ble.db.viewCh) / 60;
+    return run == null ? null : run.sku.rateFor(widget.ble.db.viewCh);
   }
 
   String _windowCaption(_Win w, DateTime upTo, int? cur) {
@@ -718,6 +761,9 @@ class _LinePageState extends State<LinePage> {
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text(w.custom ? tr('kpi.titleInterval') : (w.isShift ? tr('kpi.titleShift') : tr('kpi.title')),
               style: Theme.of(context).textTheme.titleSmall),
+          const SizedBox(height: 12),
+          Text(trp(w.isShift && !w.custom ? 'kpi.piecesShift' : 'kpi.pieces', {'n': _group(_pieces)}),
+              style: Theme.of(context).textTheme.headlineSmall),
           const SizedBox(height: 12),
           if (!w.isShift)
             Text(tr('kpi.hint'))
@@ -894,6 +940,7 @@ class _LinePageState extends State<LinePage> {
         ]),
         const SizedBox(height: 4),
         Text('${_hhmm(e.from)} – ${_hhmm(e.to)} · ${_fmt(e.ms)}', style: style),
+        if (e.synthetic) Text(tr('tl.shiftStart'), style: style),
         if (e.st == 'stop')
           Text(cause == null ? tr('tl.causeNone') : trp('tl.cause', {'c': cause}), style: style),
         if (e.comment != null && e.comment!.isNotEmpty) Text(trp('tl.comment', {'c': e.comment}), style: style),

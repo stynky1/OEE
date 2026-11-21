@@ -68,7 +68,21 @@ class BleService extends ChangeNotifier {
 
   /// Ruleaza [op] cand coada e libera; la 17 / 133 reincearca de cel mult [tries] ori (pauza 300, 600 ms ...);
   /// dupa fiecare operatiune lasa 40 ms libere.
-  Future<T> _gatt<T>(Future<T> Function() op, {int tries = 3}) {
+  /// Ultimele erori GATT (pentru Colector): ora, operatiunea, incercarea, textul scurt.
+  final List<String> gattLog = [];
+  int _gattFail = 0;
+  BluetoothDevice? _curDev;
+
+  void _logGatt(String label, int i, Object e) {
+    final n = DateTime.now();
+    String two(int v) => v.toString().padLeft(2, '0');
+    var t = e.toString().replaceAll('\n', ' ');
+    if (t.length > 110) t = t.substring(0, 110);
+    gattLog.insert(0, '${two(n.hour)}:${two(n.minute)}:${two(n.second)} $label #$i $t');
+    if (gattLog.length > 20) gattLog.removeLast();
+  }
+
+  Future<T> _gatt<T>(Future<T> Function() op, {int tries = 3, String label = 'op'}) {
     final done = Completer<T>();
     final prev = _gattTail;
     _gattTail = done.future.then<void>((_) {}, onError: (_) {});
@@ -76,11 +90,20 @@ class BleService extends ChangeNotifier {
       for (var i = 1;; i++) {
         try {
           final v = await op();
+          _gattFail = 0;
           await Future.delayed(const Duration(milliseconds: 40));
           done.complete(v);
           return;
         } catch (e) {
+          _logGatt(label, i, e);
           if (i >= tries || !_retryable(e)) {
+            // 3 operatiuni la rand esuate = stiva BLE e blocata: reconectare completa
+            if (_retryable(e) && ++_gattFail >= 3) {
+              _gattFail = 0;
+              try {
+                await _curDev?.disconnect();
+              } catch (_) {}
+            }
             done.completeError(e);
             return;
           }
@@ -230,14 +253,14 @@ class BleService extends ChangeNotifier {
         runNo: run.runNo, cycleS: run.sku.cycleS, triggerS: run.sku.triggerS);
     var ok = false;
     try {
-      final cur = await _gatt(() => ch.read());
+      final cur = await _gatt(() => ch.read(), label: 'cfg.read');
       if (cur.length >= 2 * kBlockSize) {
         // firmware 3: Config de 288 B (global + 8 canale)
         configInfo = await _pushBlocks(ch, run);
         ok = configInfo!.startsWith('Parametri scrisi');
       } else {
-        await _gatt(() => ch.write(bytes, withoutResponse: false));
-        final back = await _gatt(() => ch.read());
+        await _gatt(() => ch.write(bytes, withoutResponse: false), label: 'cfg.write');
+        final back = await _gatt(() => ch.read(), label: 'cfg.verify');
         ok = configEchoMatches(bytes, back);
         configInfo = ok
             ? 'Parametri scrisi: ${run.sku.name}, ciclu ${run.sku.cycleS.toStringAsFixed(4)} s, '
@@ -287,11 +310,11 @@ class BleService extends ChangeNotifier {
       blocks.add(encodeBlockChannel(ch: c.id, active: true, cycleS: cycleS, triggerS: triggerS));
     }
     for (final b in blocks) {
-      await _gatt(() => ch.write(b, withoutResponse: false));
+      await _gatt(() => ch.write(b, withoutResponse: false), label: 'cfg.write');
       await Future.delayed(const Duration(milliseconds: 80)); // firmware-ul aplica blocurile din bucla principala
     }
     await Future.delayed(const Duration(milliseconds: 300));
-    final back = await _gatt(() => ch.read());
+    final back = await _gatt(() => ch.read(), label: 'cfg.verify');
     final (bad, unread) = configBlockMismatches(blocks, back);
     String nm(int id) => id == 0 ? 'global' : 'CH$id ${channelName(id)}';
     final parts = <String>[];
@@ -382,16 +405,33 @@ class BleService extends ChangeNotifier {
     deviceName = dev.platformName.isNotEmpty ? dev.platformName : dev.remoteId.str;
     _set('conectare la $deviceName...');
 
+    _curDev = dev;
+    _gattFail = 0;
     await dev.connect(timeout: const Duration(seconds: 20)); // cere MTU mare; firmware-ul cere >= 200
+    await Future.delayed(const Duration(milliseconds: 600)); // lasa stiva Android sa termine conectarea (evita 133)
     mtu = 0;
     dataSubscribed = false;
     notifRaw = 0;
     try {
-      mtu = await dev.requestMtu(247); // explicit, la fiecare conexiune (firmware-ul cere >= 200)
+      await dev.requestConnectionPriority(connectionPriorityRequest: ConnectionPriority.high);
     } catch (_) {
+      // optional; ignorat
+    }
+    try {
+      mtu = await dev.requestMtu(247); // explicit, la fiecare conexiune (firmware-ul cere >= 200)
+    } catch (e) {
+      _logGatt('mtu', 1, e);
       // deja negociat sau nesuportat; ramane 0 = necunoscut
     }
-    final services = await dev.discoverServices();
+    await Future.delayed(const Duration(milliseconds: 300));
+    List<BluetoothService> services;
+    try {
+      services = await dev.discoverServices();
+    } catch (e) {
+      _logGatt('discover', 1, e);
+      await Future.delayed(const Duration(milliseconds: 800));
+      services = await dev.discoverServices(); // a doua incercare; daca esueaza, bucla de reconectare preia
+    }
     final svc = services.firstWhere((s) => s.uuid == kServiceUuid);
     BluetoothCharacteristic ch(Guid u) => svc.characteristics.firstWhere((c) => c.uuid == u);
     final data = ch(kDataUuid), ack = ch(kAckUuid), st = ch(kStatusUuid);
@@ -402,13 +442,13 @@ class BleService extends ChangeNotifier {
     final subs = <StreamSubscription>[];
     try {
       // 1. ceasul: daca ESP32 nu are ora sau deriva > 2 s fata de tableta, i-o setam
-      final first = DeviceStatus.parse(await _gatt(() => st.read()));
+      final first = DeviceStatus.parse(await _gatt(() => st.read(), label: 'status.read'));
       _resetTracking(first?.ackBoot ?? 0);
       if (first != null) {
         status = first;
         final nowS = DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000;
         if (first.utcS == 0 || (first.utcS - nowS).abs() > 2) {
-          await _gatt(() => timeChar.write(encodeTime(nowS), withoutResponse: false));
+          await _gatt(() => timeChar.write(encodeTime(nowS), withoutResponse: false), label: 'time.write');
         }
       }
       connected = true;
@@ -433,8 +473,8 @@ class BleService extends ChangeNotifier {
           lastError = e.toString();
         });
       }));
-      await _gatt(() => st.setNotifyValue(true));
-      await _gatt(() => data.setNotifyValue(true)); // la abonare ESP32 retransmite tot ce nu e confirmat
+      await _gatt(() => st.setNotifyValue(true), label: 'sub.status');
+      await _gatt(() => data.setNotifyValue(true), label: 'sub.data'); // la abonare ESP32 retransmite tot ce nu e confirmat
       dataSubscribed = true;
       lastError = null; // conexiune reusita: o eroare veche nu mai e relevanta
 
@@ -508,8 +548,8 @@ class BleService extends ChangeNotifier {
     }
     resubs++;
     try {
-      await _gatt(() => data.setNotifyValue(false));
-      await _gatt(() => data.setNotifyValue(true)); // firmware: abonare noua => retransmite tot ce nu e confirmat
+      await _gatt(() => data.setNotifyValue(false), label: 'unsub.data');
+      await _gatt(() => data.setNotifyValue(true), label: 'sub.data'); // firmware: abonare noua => retransmite tot ce nu e confirmat
     } catch (e) {
       lastError = 'Reabonarea la Data a esuat: $e';
     }
@@ -544,6 +584,12 @@ class BleService extends ChangeNotifier {
     }
 
     await db.insertMessages(device, msgs); // 1. durabil pe tableta
+    try {
+      // oprirea de inceput de schimb (de la inceputul schimbului pana la prima sticla): rand local, clasificabil
+      if (await db.ensureShiftStartStops(msgs) > 0) pendingStopCount = await db.pendingCount();
+    } catch (e) {
+      lastError = 'Oprire de inceput de schimb: $e';
+    }
 
     if (_stallB >= 0 && !boots.contains(_stallB)) {
       boots.add(_stallB);
@@ -565,7 +611,7 @@ class BleService extends ChangeNotifier {
     final ab = r.ackB, asq = r.ackS;
     if (ab != null && asq != null && _keyGreater(ab, asq, _lastAckB, _lastAckS)) {
       // 2. abia apoi confirmare cumulativa, doar pana la primul gol; coada GATT reincearca la 17 / 133
-      await _gatt(() => ack.write(encodeAck(ab, asq)));
+      await _gatt(() => ack.write(encodeAck(ab, asq)), label: 'ack');
       _lastAckB = ab;
       _lastAckS = asq;
       if (lastError != null && lastError!.contains('writeCharacteristic')) lastError = null;

@@ -15,6 +15,9 @@ import 'uuid.dart';
 /// Versiunea schemei locale. v3 = UUID-uri + tabele de configurare (vezi _migrateToV3).
 const int kDbVersion = 5;
 
+/// Identitatea "dispozitivului" pentru randurile create local de aplicatie (nu vin de la ESP32 si nu se trimit in cloud).
+const kAppDevice = 'APP';
+
 class Sku {
   Sku({this.id, required this.name, this.mode = 'pace', required this.value,
       this.triggerS = 10, this.targetOee, this.color = 0xFF9E9E9E});
@@ -457,6 +460,71 @@ class Db {
 
   bool _needBackfill = true;
 
+  static String _isoZ(DateTime t) => '${t.toUtc().toIso8601String().split('.').first}Z';
+
+  /// Oprirea de inceput de schimb: de la inceputul schimbului pana la primele sticle ale unui canal (primul `int` cu n > 0
+  /// din schimb) linia nu a produs, deci perioada e o oprire: rand `ev stop` local (device [kAppDevice], boot = inceputul
+  /// schimbului in secunde, seq = canalul), care apare in „Opriri”, se clasifica si intra in KPI ca orice oprire.
+  /// Nu se creeaza daca: golul e sub [minGapS], exista deja, canalul a avut activitate mai devreme in schimb, o oprire reala
+  /// acopera inceputul schimbului, sau (alt canal decat cel principal) canalul nu are date mai vechi (canal activat de curand).
+  /// Se apeleaza dupa salvarea fiecarui lot de mesaje. Intoarce cate randuri a creat.
+  Future<int> ensureShiftStartStops(List<Msg> msgs, {int intervalS = 5, int minGapS = 60}) async {
+    final first = <String, (int, DateTime, DateTime, int)>{};
+    for (final m in msgs) {
+      if (m.type != 'int' || m.ts == null) continue;
+      if (((m.json['n'] as num?)?.toInt() ?? 0) <= 0) continue;
+      final t = DateTime.tryParse(m.ts!);
+      if (t == null) continue;
+      final sw = shifts.current(t.toLocal());
+      if (sw == null) continue;
+      final ws = shifts.start(sw.day, sw.idx).toUtc();
+      final ch = (m.json['ch'] as num?)?.toInt() ?? 1;
+      final key = '$ch|${ws.millisecondsSinceEpoch}';
+      final prev = first[key];
+      if (prev == null || t.isBefore(prev.$3)) first[key] = (ch, ws, t, m.run);
+    }
+    var made = 0;
+    final now = DateTime.now().toUtc().millisecondsSinceEpoch;
+    for (final e in first.values) {
+      final ch = e.$1, ws = e.$2, t = e.$3, run = e.$4;
+      var to = t.subtract(Duration(seconds: intervalS)); // primul impuls e in intervalul care se termina la t
+      if (to.isBefore(ws)) to = ws;
+      if (to.difference(ws).inSeconds < minGapS) continue;
+      final wsSec = ws.millisecondsSinceEpoch ~/ 1000;
+      final fromIso = _isoZ(ws), toIso = _isoZ(to), tIso = _isoZ(t);
+      final ex = await _db.rawQuery('SELECT 1 FROM message WHERE device = ? AND boot = ? AND seq = ?', [kAppDevice, wsSec, ch]);
+      if (ex.isNotEmpty) continue;
+      final act = await _db.rawQuery('''
+          SELECT 1 FROM message WHERE ch = ? AND device != ? AND type != 'boot'
+            AND ((type = 'int' AND n > 0 AND ts >= ? AND ts < ?) OR (type = 'ev' AND st != 'stop' AND from_ts >= ? AND from_ts < ?))
+          LIMIT 1''', [ch, kAppDevice, fromIso, tIso, fromIso, tIso]);
+      if (act.isNotEmpty) continue;
+      final cov = await _db.rawQuery('''
+          SELECT 1 FROM message WHERE type = 'ev' AND st = 'stop' AND ch = ? AND device != ?
+            AND from_ts <= ? AND to_ts > ? LIMIT 1''', [ch, kAppDevice, fromIso, fromIso]);
+      if (cov.isNotEmpty) continue;
+      if (ch != mainCh) {
+        final prior = await _db.rawQuery(
+            "SELECT 1 FROM message WHERE ch = ? AND device != ? AND type != 'boot' AND COALESCE(ts, from_ts) < ? LIMIT 1",
+            [ch, kAppDevice, fromIso]);
+        if (prior.isEmpty) continue;
+      }
+      final durMs = to.difference(ws).inMilliseconds;
+      await _db.insert(
+        'message',
+        {
+          'device': kAppDevice, 'boot': wsSec, 'seq': ch, 'type': 'ev', 'run': run, 'ts': toIso, 'up_ms': 0,
+          'st': 'stop', 'from_ts': fromIso, 'to_ts': toIso, 'dur_ms': durMs, 'kind': 'shift_start',
+          'body': jsonEncode({'v': 1, 't': 'ev', 'st': 'stop', 'ch': ch, 'from': fromIso, 'to': toIso, 'dur_ms': durMs, 'synthetic': 'shift_start'}),
+          'ch': ch, 'received_at': now, 'synced': 1, // synced = 1: nu se trimite in cloud (nu e mesaj de la dispozitiv)
+        },
+        conflictAlgorithm: ConflictAlgorithm.ignore,
+      );
+      made++;
+    }
+    return made;
+  }
+
   /// P-31: mesajele fara ora (ESP32 inainte ca tableta sa scrie Time) primesc ora din uptime:
   /// ora unui mesaj cu ora din acelasi boot, minus diferenta de uptime. Mesajele `boot` nu se ating.
   /// Intoarce numarul de mesaje completate; boot-urile fara niciun mesaj cu ora raman pentru mai tarziu.
@@ -512,7 +580,7 @@ class Db {
       0;
 
   Future<List<Map<String, Object?>>> latest(int n) =>
-      _db.query('message', orderBy: 'boot DESC, seq DESC', limit: n);
+      _db.query('message', where: 'device != ?', whereArgs: [kAppDevice], orderBy: 'boot DESC, seq DESC', limit: n);
 
   // ----- produse (SKU) si run-uri -----
   Future<List<Sku>> skus() async {
@@ -612,7 +680,7 @@ class Db {
       SELECT m.* FROM message m
       LEFT JOIN cause c ON c.device = m.device AND c.boot = m.boot AND c.seq = m.seq
       WHERE m.type = 'ev' AND m.st = 'stop' AND m.ch = ? AND c.seq IS NULL
-      ORDER BY m.boot DESC, m.seq DESC LIMIT 200''', [ch ?? viewCh]);
+      ORDER BY COALESCE(m.from_ts, m.ts, '') DESC, m.boot DESC, m.seq DESC LIMIT 200''', [ch ?? viewCh]);
 
   /// Motive: nivelul 1 (parentId null) sau detaliile unei clase. Implicit doar cele active;
   /// [kinds] limiteaza clasele (operatorul vede doar clasele de oprire); [legacy] = codurile vechi (fara clasa).
@@ -1027,7 +1095,7 @@ class Db {
 
   /// Evenimente cu cauza (daca a fost clasificata), care se suprapun cu intervalul [fromIso, toIso].
   Future<List<Map<String, Object?>>> eventsDetailed(String fromIso, String toIso) => _db.rawQuery('''
-      SELECT m.st AS st, m.from_ts AS from_ts, m.to_ts AS to_ts, m.dur_ms AS dur_ms,
+      SELECT m.st AS st, m.from_ts AS from_ts, m.to_ts AS to_ts, m.dur_ms AS dur_ms, m.device AS device,
              l1.name AS c1, l1.kind AS k1, l2.name AS c2, c.comment AS comment
       FROM message m
       LEFT JOIN cause c ON c.device = m.device AND c.boot = m.boot AND c.seq = m.seq

@@ -315,6 +315,7 @@ class CollectorPage extends StatelessWidget {
               }
               return out;
             }),
+            _DiagTile('Erori GATT (ultimele 20)', () async => List<String>.from(ble.gattLog)),
             const Divider(height: 32),
             Text('Ultimele mesaje', style: Theme.of(context).textTheme.titleSmall),
             for (final r in ble.latest)
