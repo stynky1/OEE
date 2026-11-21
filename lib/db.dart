@@ -489,11 +489,34 @@ class Db {
       final ch = e.$1, ws = e.$2, t = e.$3, run = e.$4;
       var to = t.subtract(Duration(seconds: intervalS)); // primul impuls e in intervalul care se termina la t
       if (to.isBefore(ws)) to = ws;
-      if (to.difference(ws).inSeconds < minGapS) continue;
       final wsSec = ws.millisecondsSinceEpoch ~/ 1000;
-      final fromIso = _isoZ(ws), toIso = _isoZ(to), tIso = _isoZ(t);
-      final ex = await _db.rawQuery('SELECT 1 FROM message WHERE device = ? AND boot = ? AND seq = ?', [kAppDevice, wsSec, ch]);
-      if (ex.isNotEmpty) continue;
+      final fromIso = _isoZ(ws), tIso = _isoZ(t);
+      // oprirea sintetica se termina la primul eveniment REAL al canalului din schimb (ex. o oprire
+      // pastrata de placa, primita dupa conectare), ca sa nu se suprapuna cu acesta
+      final ev0 = await _db.rawQuery(
+          "SELECT MIN(from_ts) AS f FROM message WHERE ch = ? AND device != ? AND type = 'ev' AND from_ts >= ?",
+          [ch, kAppDevice, fromIso]);
+      final f0 = DateTime.tryParse('${ev0.first['f'] ?? ''}');
+      if (f0 != null && f0.isBefore(to)) to = f0.isBefore(ws) ? ws : f0;
+      final toIso = _isoZ(to);
+      final ex = await _db.rawQuery('SELECT to_ts FROM message WHERE device = ? AND boot = ? AND seq = ?', [kAppDevice, wsSec, ch]);
+      if (ex.isNotEmpty) {
+        if ('${ex.first['to_ts']}' != toIso && to.isAfter(ws)) {
+          final dm = to.difference(ws).inMilliseconds;
+          await _db.update(
+            'message',
+            {
+              'to_ts': toIso, 'ts': toIso, 'dur_ms': dm,
+              'body': jsonEncode({'v': 1, 't': 'ev', 'st': 'stop', 'ch': ch, 'from': fromIso, 'to': toIso, 'dur_ms': dm, 'synthetic': 'shift_start'}),
+            },
+            where: 'device = ? AND boot = ? AND seq = ?',
+            whereArgs: [kAppDevice, wsSec, ch],
+          );
+          made++;
+        }
+        continue;
+      }
+      if (to.difference(ws).inSeconds < minGapS) continue;
       final act = await _db.rawQuery('''
           SELECT 1 FROM message WHERE ch = ? AND device != ? AND type != 'boot'
             AND ((type = 'int' AND n > 0 AND ts >= ? AND ts < ?) OR (type = 'ev' AND st != 'stop' AND from_ts >= ? AND from_ts < ?))
