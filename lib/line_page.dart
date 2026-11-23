@@ -13,7 +13,7 @@ import 'login_page.dart';
 import 'shifts.dart';
 
 const _cRun = Color(0xFF16A34A);
-const _cSlow = Color(0xFFEA580C); // portocaliu inchis
+const _cSlow = Color(0xFFFF9800); // portocaliu (distinct de rosu = oprit si de galben = microoprire)
 const _cMicro = Color(0xFFFACC15); // galben
 const _cStop = Color(0xFFDC2626);
 const _cFast = Color(0xFF2563EB);
@@ -141,7 +141,7 @@ class _LinePageState extends State<LinePage> {
   DateTime? _chartStart;
   DateTime? _effStart; // primul moment cu date in fereastra
   double? _avail, _perf, _oee;
-  int _stopMs = 0, _stopCount = 0, _noDataMs = 0, _unknownPulses = 0, _plannedMs = 0, _windowMs = 0;
+  int _stopMs = 0, _stopCount = 0, _noDataMs = 0, _unknownPulses = 0, _plannedMs = 0;
   double? _speedNow; // buc/ora, calculat pe ultimul minut
   int _pieces = 0; // sticle numarate in fereastra afisata (de la inceputul schimbului)
   int _exclMs = 0; // timp exclus din calcul (opriri neprogramate / planificate, dupa setare)
@@ -561,7 +561,6 @@ class _LinePageState extends State<LinePage> {
       _stopCount = stopCount;
       _noDataMs = noDataMs;
       _plannedMs = planned > 0 ? planned : 0;
-      _windowMs = upTo.difference(w.start).inMilliseconds;
       _unknownPulses = unknown;
       _speedNow = speedNow;
       _pieces = pulses;
@@ -776,14 +775,8 @@ class _LinePageState extends State<LinePage> {
             ]),
             const SizedBox(height: 12),
             Text(
-              trp('kpi.oeeNote', {'tgt': tgt == null ? tr('kpi.unset') : _pct(tgt)}),
-              style: Theme.of(context).textTheme.labelSmall,
-            ),
-            const SizedBox(height: 8),
-            Text(
               trp(w.custom ? 'kpi.calcInterval' : 'kpi.calcShift', {
                 'a': _fmt(_plannedMs),
-                'b': _fmt(_windowMs),
                 'nd': _noDataMs > 0 ? trp('kpi.withoutNoData', {'t': _fmt(_noDataMs)}) : '',
               }),
               style: Theme.of(context).textTheme.labelSmall,
