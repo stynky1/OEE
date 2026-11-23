@@ -1,7 +1,7 @@
 name: oee
 description: OEE — monitorizare opriri linie (tableta Android, client BLE pentru ESP32-S3).
 publish_to: none
-version: 0.16.1+3
+version: 0.16.2+4
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
