@@ -54,7 +54,7 @@ jobs:
           echo "apksigner din: $BT"
           echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/oee.p12"
           APK_DIR=build/app/outputs/flutter-apk
-          "$BT/apksigner" sign --ks "$RUNNER_TEMP/oee.p12" --ks-key-alias "${KS_ALIAS:-oee}" \
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/oee.p12" --ks-key-alias "${KS_ALIAS:-erka}" \
             --ks-pass env:KS_PASS --out "$APK_DIR/oee-signed.apk" "$APK_DIR/app-release.apk"
           "$BT/apksigner" verify --print-certs "$APK_DIR/oee-signed.apk"
           mv "$APK_DIR/oee-signed.apk" "$APK_DIR/app-release.apk"
