@@ -494,7 +494,7 @@ class Db {
       // oprirea sintetica se termina la primul eveniment REAL al canalului din schimb (ex. o oprire
       // pastrata de placa, primita dupa conectare), ca sa nu se suprapuna cu acesta
       final ev0 = await _db.rawQuery(
-          "SELECT MIN(from_ts) AS f FROM message WHERE ch = ? AND device != ? AND type = 'ev' AND from_ts >= ?",
+          "SELECT MIN(from_ts) AS f FROM message WHERE ch = ? AND device != ? AND type = 'ev' AND from_ts >= ? AND ${_nv('message')}",
           [ch, kAppDevice, fromIso]);
       final f0 = DateTime.tryParse('${ev0.first['f'] ?? ''}');
       if (f0 != null && f0.isBefore(to)) to = f0.isBefore(ws) ? ws : f0;
@@ -524,7 +524,7 @@ class Db {
       if (act.isNotEmpty) continue;
       final cov = await _db.rawQuery('''
           SELECT 1 FROM message WHERE type = 'ev' AND st = 'stop' AND ch = ? AND device != ?
-            AND from_ts <= ? AND to_ts > ? LIMIT 1''', [ch, kAppDevice, fromIso, fromIso]);
+            AND from_ts <= ? AND to_ts > ? AND ${_nv('message')} LIMIT 1''', [ch, kAppDevice, fromIso, fromIso]);
       if (cov.isNotEmpty) continue;
       if (ch != mainCh) {
         final prior = await _db.rawQuery(
@@ -702,7 +702,7 @@ class Db {
   Future<List<Map<String, Object?>>> pendingStops({int? ch}) => _db.rawQuery('''
       SELECT m.* FROM message m
       LEFT JOIN cause c ON c.device = m.device AND c.boot = m.boot AND c.seq = m.seq
-      WHERE m.type = 'ev' AND m.st = 'stop' AND m.ch = ? AND c.seq IS NULL
+      WHERE m.type = 'ev' AND m.st = 'stop' AND m.ch = ? AND c.seq IS NULL AND ${_nv('m')}
       ORDER BY COALESCE(m.from_ts, m.ts, '') DESC, m.boot DESC, m.seq DESC LIMIT 200''', [ch ?? viewCh]);
 
   /// Motive: nivelul 1 (parentId null) sau detaliile unei clase. Implicit doar cele active;
@@ -787,8 +787,135 @@ class Db {
   Future<List<Map<String, Object?>>> allPendingStops(int ch) => _db.rawQuery('''
       SELECT m.* FROM message m
       LEFT JOIN cause c ON c.device = m.device AND c.boot = m.boot AND c.seq = m.seq
-      WHERE m.type = 'ev' AND m.st = 'stop' AND m.ch = ? AND c.seq IS NULL
+      WHERE m.type = 'ev' AND m.st = 'stop' AND m.ch = ? AND c.seq IS NULL AND ${_nv('m')}
       ORDER BY m.boot DESC, m.seq DESC''', [ch]);
+
+  // ----- pagina "Opriri": lista completa, impartire, combinare -----
+  /// Conditie SQL: evenimentul [a] nu e anulat (impartit / combinat). Mesajul brut ramane in baza; anularea e locala.
+  static String _nv(String a) =>
+      "NOT EXISTS (SELECT 1 FROM event_void v WHERE v.device = $a.device AND v.boot = $a.boot AND v.seq = $a.seq AND v.restored_at IS NULL)";
+
+  /// Toate opririle unui canal (cu sau fara motiv), cu motivul si produsul; [fromIso]/[toIso] = limitele perioadei (UTC), optionale.
+  Future<List<Map<String, Object?>>> stopsList(int ch, {String? fromIso, String? toIso, int limit = 1000}) =>
+      _db.rawQuery(
+          '''
+      SELECT m.device AS device, m.boot AS boot, m.seq AS seq, m.run AS run, m.ch AS ch, m.from_ts AS from_ts,
+             m.to_ts AS to_ts, m.dur_ms AS dur_ms, m.kind AS kind,
+             c.code1 AS code1, c.code2 AS code2, c.comment AS comment,
+             l1.name AS c1, l1.kind AS k1, l2.name AS c2, s.name AS sku
+      FROM message m
+      LEFT JOIN cause c ON c.device = m.device AND c.boot = m.boot AND c.seq = m.seq
+      LEFT JOIN loss_code l1 ON l1.id = c.code1
+      LEFT JOIN loss_code l2 ON l2.id = c.code2
+      LEFT JOIN run r ON r.run_no = m.run
+      LEFT JOIN sku s ON s.id = r.sku_id
+      WHERE m.type = 'ev' AND m.st = 'stop' AND m.ch = ? AND ${_nv('m')}
+        ${fromIso != null ? 'AND m.to_ts >= ?' : ''} ${toIso != null ? 'AND m.from_ts <= ?' : ''}
+      ORDER BY COALESCE(m.from_ts, m.ts, '') DESC, m.boot DESC, m.seq DESC LIMIT ?''',
+          [ch, if (fromIso != null) fromIso, if (toIso != null) toIso, limit]);
+
+  Future<void> _voidIn(DatabaseExecutor x, String dev, int boot, int seq, String reason, int nowMs) => x.insert(
+      'event_void',
+      {'device': dev, 'boot': boot, 'seq': seq, 'voided_at': nowMs, 'user_uuid': currentUser?.uuid, 'reason': reason},
+      conflictAlgorithm: ConflictAlgorithm.replace);
+
+  /// Rand local de oprire (device APP, synced = 1: nu pleaca in cloud) pentru o parte dintr-o oprire impartita sau pentru una combinata.
+  Future<void> _insertLocalStop(DatabaseExecutor x, int boot, int seq, int ch, int run, DateTime from, DateTime to,
+      String kind, Map<String, Object?> extra, int nowMs) {
+    final fi = _isoZ(from), ti = _isoZ(to);
+    final dm = to.difference(from).inMilliseconds;
+    return x.insert('message', {
+      'device': kAppDevice, 'boot': boot, 'seq': seq, 'type': 'ev', 'run': run, 'ts': ti, 'up_ms': 0,
+      'st': 'stop', 'from_ts': fi, 'to_ts': ti, 'dur_ms': dm, 'kind': kind,
+      'body': jsonEncode({'v': 1, 't': 'ev', 'st': 'stop', 'ch': ch, 'from': fi, 'to': ti, 'dur_ms': dm, 'synthetic': kind, ...extra}),
+      'ch': ch, 'received_at': nowMs, 'synced': 1,
+    });
+  }
+
+  /// Copiaza motivul unei opriri pe o alta (partile noi pornesc cu motivul vechi; se pot schimba apoi).
+  Future<void> _copyCause(DatabaseExecutor x, String dev, int boot, int seq, int toBoot, int toSeq, int nowMs) async {
+    final c = await x.rawQuery('SELECT code1, code2, comment FROM cause WHERE device = ? AND boot = ? AND seq = ?', [dev, boot, seq]);
+    if (c.isEmpty) return;
+    await x.insert(
+        'cause',
+        {
+          'device': kAppDevice, 'boot': toBoot, 'seq': toSeq, 'code1': c.first['code1'], 'code2': c.first['code2'],
+          'comment': c.first['comment'], 'created_at': nowMs, 'uuid': newUuid(), 'user_uuid': currentUser?.uuid,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  /// Imparte o oprire in doua, la momentul [at] (intre inceput si sfarsit). Originalul se anuleaza (ramane in baza),
+  /// iar cele doua parti sunt opriri locale, cu motivul vechi. Intoarce false daca momentul nu e valid.
+  Future<bool> splitStop(Map<String, Object?> r, DateTime at) async {
+    final f = DateTime.tryParse('${r['from_ts'] ?? ''}'), t = DateTime.tryParse('${r['to_ts'] ?? ''}');
+    if (f == null || t == null) return false;
+    final a = DateTime.fromMillisecondsSinceEpoch(at.millisecondsSinceEpoch ~/ 1000 * 1000, isUtc: true);
+    final fu = f.toUtc(), tu = t.toUtc();
+    if (!a.isAfter(fu) || !a.isBefore(tu)) return false;
+    final dev = r['device'] as String;
+    final boot = (r['boot'] as num).toInt(), seq = (r['seq'] as num).toInt();
+    final ch = (r['ch'] as num?)?.toInt() ?? viewCh;
+    final run = (r['run'] as num?)?.toInt() ?? 0;
+    final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
+    final lb = nowMs ~/ 1000;
+    await _db.transaction((txn) async {
+      await _voidIn(txn, dev, boot, seq, 'split', nowMs);
+      final mx = Sqflite.firstIntValue(await txn.rawQuery(
+              'SELECT COALESCE(MAX(seq), 999) FROM message WHERE device = ? AND boot = ?', [kAppDevice, lb])) ??
+          999;
+      final parts = [(fu, a), (a, tu)];
+      for (var i = 0; i < 2; i++) {
+        final s = mx + 1 + i;
+        await _insertLocalStop(txn, lb, s, ch, run, parts[i].$1, parts[i].$2, 'split', {'parent': '$dev/$boot/$seq'}, nowMs);
+        await _copyCause(txn, dev, boot, seq, lb, s, nowMs);
+      }
+    });
+    await _audit('stop_split', 'message', jsonEncode({'stop': '$dev/$boot/$seq', 'at': _isoZ(a)}));
+    return true;
+  }
+
+  /// Combina 2 sau mai multe opriri ale aceluiasi canal intr-una singura (de la cea mai veche pornire la cel mai tarziu sfarsit).
+  /// Originalele se anuleaza; oprirea noua preia motivul celei mai lungi opriri care are motiv.
+  Future<bool> mergeStops(List<Map<String, Object?>> rs) async {
+    if (rs.length < 2) return false;
+    DateTime? f, t;
+    final ch = (rs.first['ch'] as num?)?.toInt() ?? viewCh;
+    Map<String, Object?>? best, longest;
+    for (final r in rs) {
+      if (((r['ch'] as num?)?.toInt() ?? ch) != ch) return false;
+      final a = DateTime.tryParse('${r['from_ts'] ?? ''}')?.toUtc(), b = DateTime.tryParse('${r['to_ts'] ?? ''}')?.toUtc();
+      if (a == null || b == null) return false;
+      if (f == null || a.isBefore(f)) f = a;
+      if (t == null || b.isAfter(t)) t = b;
+      final d = (r['dur_ms'] as num?)?.toInt() ?? 0;
+      if (longest == null || d > ((longest['dur_ms'] as num?)?.toInt() ?? 0)) longest = r;
+      if (r['code1'] != null && (best == null || d > ((best['dur_ms'] as num?)?.toInt() ?? 0))) best = r;
+    }
+    final run = (longest!['run'] as num?)?.toInt() ?? 0;
+    final fFrom = f!, tTo = t!;
+    final bestRow = best;
+    final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
+    final lb = nowMs ~/ 1000;
+    await _db.transaction((txn) async {
+      for (final r in rs) {
+        await _voidIn(txn, r['device'] as String, (r['boot'] as num).toInt(), (r['seq'] as num).toInt(), 'merge', nowMs);
+      }
+      final mx = Sqflite.firstIntValue(await txn.rawQuery(
+              'SELECT COALESCE(MAX(seq), 999) FROM message WHERE device = ? AND boot = ?', [kAppDevice, lb])) ??
+          999;
+      final s = mx + 1;
+      await _insertLocalStop(txn, lb, s, ch, run, fFrom, tTo, 'merge',
+          {'parents': [for (final r in rs) '${r['device']}/${r['boot']}/${r['seq']}']}, nowMs);
+      if (bestRow != null) {
+        await _copyCause(
+            txn, bestRow['device'] as String, (bestRow['boot'] as num).toInt(), (bestRow['seq'] as num).toInt(), lb, s, nowMs);
+      }
+    });
+    await _audit('stop_merge', 'message',
+        jsonEncode({'stops': [for (final r in rs) '${r['device']}/${r['boot']}/${r['seq']}'], 'from': _isoZ(fFrom), 'to': _isoZ(tTo)}));
+    return true;
+  }
 
   /// Clasifica in masa opririle date cu acelasi motiv (o singura tranzactie) si scrie o linie de audit.
   Future<int> saveCauseBulk(List<Map<String, Object?>> rows, int code1, int? code2, String? comment) async {
@@ -818,7 +945,7 @@ class Db {
     final r = await _db.rawQuery('''
         SELECT COUNT(*) AS n FROM message m
         LEFT JOIN cause c ON c.device = m.device AND c.boot = m.boot AND c.seq = m.seq
-        WHERE m.type = 'ev' AND m.st = 'stop' AND c.seq IS NULL
+        WHERE m.type = 'ev' AND m.st = 'stop' AND c.seq IS NULL AND ${_nv('m')}
           AND ${ch == null ? 'm.ch IN (SELECT id FROM channel WHERE active = 1)' : 'm.ch = ?'}''',
         ch == null ? [] : [ch]);
     return (r.first['n'] as num?)?.toInt() ?? 0;
@@ -1113,19 +1240,19 @@ class Db {
   /// Evenimente (stop / micro / slow / fast) cu interval cunoscut, care se termina dupa [fromIso] (UTC, fara milisecunde).
   Future<List<Map<String, Object?>>> eventsSince(String fromIso) => _db.rawQuery('''
       SELECT st, from_ts, to_ts, dur_ms FROM message
-      WHERE type = 'ev' AND ch = ? AND from_ts IS NOT NULL AND to_ts IS NOT NULL AND to_ts >= ?
+      WHERE type = 'ev' AND ch = ? AND from_ts IS NOT NULL AND to_ts IS NOT NULL AND to_ts >= ? AND ${_nv('message')}
       ORDER BY to_ts''', [viewCh, fromIso]);
 
   /// Evenimente cu cauza (daca a fost clasificata), care se suprapun cu intervalul [fromIso, toIso].
   Future<List<Map<String, Object?>>> eventsDetailed(String fromIso, String toIso) => _db.rawQuery('''
-      SELECT m.st AS st, m.from_ts AS from_ts, m.to_ts AS to_ts, m.dur_ms AS dur_ms, m.device AS device,
+      SELECT m.st AS st, m.from_ts AS from_ts, m.to_ts AS to_ts, m.dur_ms AS dur_ms, m.device AS device, m.kind AS mkind,
              l1.name AS c1, l1.kind AS k1, l2.name AS c2, c.comment AS comment
       FROM message m
       LEFT JOIN cause c ON c.device = m.device AND c.boot = m.boot AND c.seq = m.seq
       LEFT JOIN loss_code l1 ON l1.id = c.code1
       LEFT JOIN loss_code l2 ON l2.id = c.code2
       WHERE m.type = 'ev' AND m.ch = ? AND m.from_ts IS NOT NULL AND m.to_ts IS NOT NULL
-        AND m.to_ts >= ? AND m.from_ts <= ?
+        AND m.to_ts >= ? AND m.from_ts <= ? AND ${_nv('m')}
       ORDER BY m.from_ts''', [viewCh, fromIso, toIso]);
 
   /// Impulsuri numarate in [fromIso, toIso) si timpul ideal corespunzator (impulsuri x timp de ciclu al produsului run-ului).

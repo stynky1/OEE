@@ -300,7 +300,8 @@ Future<List<Object?>?> _kpiRow(Db db, ChannelRow c, (DateTime, DateTime) sp, Dat
     LEFT JOIN cause c ON c.device = m.device AND c.boot = m.boot AND c.seq = m.seq
     LEFT JOIN loss_code l1 ON l1.id = c.code1
     WHERE m.type = 'ev' AND m.st = 'stop' AND m.ch = ? AND m.from_ts IS NOT NULL AND m.to_ts IS NOT NULL
-      AND m.to_ts >= ? AND m.from_ts <= ?''', [c.id, a, b]);
+      AND m.to_ts >= ? AND m.from_ts <= ?
+      AND NOT EXISTS (SELECT 1 FROM event_void v WHERE v.device = m.device AND v.boot = m.boot AND v.seq = m.seq AND v.restored_at IS NULL)''', [c.id, a, b]);
   var stopMs = 0, stopCount = 0, exclMs = 0;
   for (final e in stops) {
     final f = _p(e['from_ts']);

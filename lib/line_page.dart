@@ -25,7 +25,8 @@ const _kLive = -1; // „Ultimele 8 ore” (live)
 const _kCustom = -2; // „Interval” (de la – pana la, ales de utilizator)
 
 class _Ev {
-  _Ev(this.st, this.from, this.to, this.ms, this.cat, this.sub, this.comment, this.kind, {this.synthetic = false});
+  _Ev(this.st, this.from, this.to, this.ms, this.cat, this.sub, this.comment, this.kind, {this.synthetic = false, this.mkind});
+  final String? mkind; // shift_start | split | merge (doar la randurile locale)
   final bool synthetic; // oprire de inceput de schimb creata local (device APP)
   final String st;
   final String? kind; // clasa IWS a motivului (unscheduled | planned | unplanned | ...), null = neclasificat sau cod vechi
@@ -365,7 +366,7 @@ class _LinePageState extends State<LinePage> {
       final k1 = r['k1'] as String?;
       final c1 = r['c1'] as String?;
       evs.add(_Ev('${r['st']}', f, t, ms, c1 == null ? null : lossLabel(c1, k1), r['c2'] as String?,
-          r['comment'] as String?, k1, synthetic: r['device'] == kAppDevice));
+          r['comment'] as String?, k1, synthetic: r['device'] == kAppDevice, mkind: r['mkind'] as String?));
     }
     // oprire de inceput de schimb (de la inceputul schimbului pana la prima sticla): calculul porneste de la inceputul schimbului
     _Ev? lead;
@@ -376,7 +377,7 @@ class _LinePageState extends State<LinePage> {
     final sinceStart = nowU.difference(w.start).inSeconds;
     if (lead == null && w.isShift && !w.custom && ble.connected && chActive && nowU.isBefore(w.end) && sinceStart >= 60 &&
         ((pt['pulses'] as num?)?.toInt() ?? 0) == 0 && !evs.any((e) => e.st != 'stop')) {
-      lead = _Ev('stop', w.start, nowU, nowU.difference(w.start).inMilliseconds, null, null, null, null, synthetic: true);
+      lead = _Ev('stop', w.start, nowU, nowU.difference(w.start).inMilliseconds, null, null, null, null, synthetic: true, mkind: 'shift_start');
       evs.add(lead);
     }
 
@@ -933,7 +934,7 @@ class _LinePageState extends State<LinePage> {
         ]),
         const SizedBox(height: 4),
         Text('${_hhmm(e.from)} – ${_hhmm(e.to)} · ${_fmt(e.ms)}', style: style),
-        if (e.synthetic) Text(tr('tl.shiftStart'), style: style),
+        if (e.synthetic && e.mkind == 'shift_start') Text(tr('tl.shiftStart'), style: style),
         if (e.st == 'stop')
           Text(cause == null ? tr('tl.causeNone') : trp('tl.cause', {'c': cause}), style: style),
         if (e.comment != null && e.comment!.isNotEmpty) Text(trp('tl.comment', {'c': e.comment}), style: style),
